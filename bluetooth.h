@@ -54,28 +54,85 @@ void startPeriodicAdvertising() {
   Bluefruit.Advertising.start(30);  // Advertise for exactly 30 seconds
 }
 
-  bool waitForConnectionOrInterrupt(uint32_t sensor_interrupt) {
-    uint32_t start = millis();
-
-    while (millis() - start < timeout_ms) {
-      // Check for interrupt
-      if (wakeReason_interrupt) {
-        Serial.println("Interrupt detected - aborting BLE");
-        Bluefruit.Advertising.stop();
-        return false;  // Exit early
-      }
-
-      // Check for connection
-      if (Bluefruit.connected()) {
-        return true;  // Connected!
-      }
-
-      // Sleep between checks (low power)
-      sd_app_evt_wait();  // Wakes on any event
-    }
-
-    return false;  // Timeout
+void sendLogDataViaNotify() {
+  if (!Bluefruit.connected()) {
+    Serial.println("No connection - cannot send log data");
+    return;
   }
+  
+  Serial.println("📤 Sending stored log data via BLE notifications...");
+  
+  // Send start marker
+  String startMsg = "LOG_START";
+  testCharacteristic.notify(startMsg.c_str());
+  delay(50);
+  
+  int totalBytesSent = 0;
+  
+  // First send time data
+  if (InternalFS.exists("/time.txt")) {
+    File timeFile = InternalFS.open("/time.txt", FILE_O_READ);
+    if (timeFile) {
+      Serial.println("Sending time.txt contents:");
+      while (timeFile.available()) {
+        String line = timeFile.readStringUntil('\n');
+        if (line.length() > 0) {
+          // Add newline back
+          line += "\n";
+          
+          // Send complete lines up to 18 bytes
+          while (line.length() > 0) {
+            String chunk = line.substring(0, min(18, (int)line.length()));
+            line = line.substring(chunk.length());
+            
+            testCharacteristic.notify(chunk.c_str());
+            totalBytesSent += chunk.length();
+            Serial.print("Sent chunk: ");
+            Serial.print(chunk);
+            delay(50); // Optimized delay for maximum speed
+          }
+        }
+      }
+      timeFile.close();
+    }
+  }
+  
+  // Then send state data
+  if (InternalFS.exists("/state.txt")) {
+    File stateFile = InternalFS.open("/state.txt", FILE_O_READ);
+    if (stateFile) {
+      Serial.println("Sending state.txt contents:");
+      while (stateFile.available()) {
+        String line = stateFile.readStringUntil('\n');
+        if (line.length() > 0) {
+          // Add newline back
+          line += "\n";
+          
+          // Send complete lines up to 18 bytes
+          while (line.length() > 0) {
+            String chunk = line.substring(0, min(18, (int)line.length()));
+            line = line.substring(chunk.length());
+            
+            testCharacteristic.notify(chunk.c_str());
+            totalBytesSent += chunk.length();
+            Serial.print("Sent chunk: ");
+            Serial.print(chunk);
+            delay(50); // Optimized delay for maximum speed
+          }
+        }
+      }
+      stateFile.close();
+    }
+  }
+  
+  // Send end marker
+  String endMsg = "LOG_END";
+  testCharacteristic.notify(endMsg.c_str());
+  delay(50);
+  
+  Serial.print("📤 Log data transmission complete. Total bytes sent: ");
+  Serial.println(totalBytesSent);
+}
 
 void startAdv(void) {
   // Advertising packet
@@ -100,6 +157,13 @@ void startAdv(void) {
 
 // Callback for when ACK is received
 void ack_write_callback(uint16_t conn_hdl, BLECharacteristic* chr, uint8_t* data, uint16_t len) {
+  digitalWrite(LED_BUILTIN, LOW);  // Flash LED immediately
+  delay(50);
+  digitalWrite(LED_BUILTIN, HIGH);
+  
+  Serial.println("================================");
+  Serial.println("🚨 ACK CALLBACK TRIGGERED! 🚨");
+  Serial.println("================================");
   Serial.print("ACK received! Length: ");
   Serial.print(len);
   Serial.print(" Data: ");
@@ -112,12 +176,45 @@ void ack_write_callback(uint16_t conn_hdl, BLECharacteristic* chr, uint8_t* data
   }
   Serial.println();
   
-  // Check if it's our expected ACK pattern [0xAC, 0xCE, 0x55]
+  // Check if it's our expected ACK pattern [0xAC, 0xCE, 0x55] + timestamp
   if (len >= 3 && data[0] == 0xAC && data[1] == 0xCE && data[2] == 0x55) {
     Serial.println("✅ Valid ACK pattern received!");
+    
+    // If we have timestamp data (7 bytes total)
+    if (len >= 7) {
+      // Parse UTC timestamp (4 bytes, little-endian)
+      uint32_t timestamp = ((uint32_t)data[6] << 24) | 
+                          ((uint32_t)data[5] << 16) | 
+                          ((uint32_t)data[4] << 8) | 
+                          data[3];
+      
+      Serial.print("📅 Particle UTC timestamp: ");
+      Serial.println(timestamp);
+      
+      // Convert to human-readable format
+      // Basic conversion (days since Jan 1, 1970)
+      uint32_t days = timestamp / 86400;
+      uint32_t hours = (timestamp % 86400) / 3600;
+      uint32_t minutes = (timestamp % 3600) / 60;
+      uint32_t seconds = timestamp % 60;
+      
+      Serial.print("📅 Particle time: Day ");
+      Serial.print(days);
+      Serial.print(" ");
+      Serial.print(hours);
+      Serial.print(":");
+      if (minutes < 10) Serial.print("0");
+      Serial.print(minutes);
+      Serial.print(":");
+      if (seconds < 10) Serial.print("0");
+      Serial.println(seconds);
+    }
+    
     ackReceived = true;
     lastAckTime = millis();
     
+    // Now send the stored log data back to Particle
+    sendLogDataViaNotify();
   }
 }
 
@@ -134,12 +231,17 @@ void setupBLEService(void) {
   testCharacteristic.begin();
 
   // Create ACK characteristic (writable)
+  Serial.println("Creating ACK characteristic...");
   ackCharacteristic = BLECharacteristic(ACK_CHARACTERISTIC_UUID);
   ackCharacteristic.setProperties(CHR_PROPS_WRITE | CHR_PROPS_WRITE_WO_RESP);
   ackCharacteristic.setPermission(SECMODE_OPEN, SECMODE_OPEN);
   ackCharacteristic.setMaxLen(20);
   ackCharacteristic.setWriteCallback(ack_write_callback);
-  ackCharacteristic.begin();
+  uint8_t result = ackCharacteristic.begin();
+  Serial.print("ACK characteristic begin() returned: ");
+  Serial.println(result);
+  Serial.print("ACK UUID: ");
+  Serial.println(ACK_CHARACTERISTIC_UUID);
 
   // Set initial value
   String initialValue = "XIAO Ready";
@@ -156,6 +258,8 @@ void connect_callback(uint16_t conn_handle) {
 
   Serial.print("Connected to ");
   Serial.println(central_name);
+  Serial.print("Connection handle: ");
+  Serial.println(conn_handle);
   
   // Reset ACK status on new connection
   ackReceived = false;
@@ -173,8 +277,16 @@ void disconnect_callback(uint16_t conn_handle, uint8_t reason) {
   (void) conn_handle;
   (void) reason;
 
-  Serial.print("Disconnected, reason = 0x"); Serial.println(reason, HEX);
+  Serial.print("Disconnected at millis=");
+  Serial.print(millis());
+  Serial.print(", reason = 0x"); 
+  Serial.println(reason, HEX);
   Serial.println("Advertising will restart automatically");
+  
+  // Check if we ever got ACK
+  if (ackReceived) {
+    Serial.println("Note: ACK was received before disconnect");
+  }
   
   // Reset ACK status
   ackReceived = false;
